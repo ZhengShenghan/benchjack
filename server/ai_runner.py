@@ -32,6 +32,14 @@ class RateLimitError(RuntimeError):
 class RunResult:
     output: str
     exit_code: int
+    # Usage accounting, populated from the backend's final ``result`` event.
+    # For backends/streams that don't report usage these stay at their
+    # defaults (0 / None) so callers degrade gracefully.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float | None = None
+    num_turns: int = 0
+    model: str | None = None
 
 
 class AIRunner:
@@ -95,13 +103,34 @@ class AIRunner:
         """Run to completion and return the full output."""
         lines: list[str] = []
         exit_code = 0
+        in_tokens = out_tokens = num_turns = 0
+        cost: float | None = None
+        model: str | None = None
         try:
             async for event in self.stream(prompt, cwd=cwd):
-                if event.get("msg_type") == "text":
+                mt = event.get("msg_type")
+                if mt == "text":
                     lines.append(event["text"])
+                elif mt == "usage":
+                    in_tokens += int(event.get("input_tokens", 0) or 0)
+                    out_tokens += int(event.get("output_tokens", 0) or 0)
+                    num_turns += int(event.get("num_turns", 0) or 0)
+                    c = event.get("cost_usd")
+                    if c is not None:
+                        cost = (cost or 0.0) + float(c)
+                    if event.get("model") and not model:
+                        model = event["model"]
         except Exception:
             exit_code = 1
-        return RunResult(output="\n".join(lines), exit_code=exit_code)
+        return RunResult(
+            output="\n".join(lines),
+            exit_code=exit_code,
+            input_tokens=in_tokens,
+            output_tokens=out_tokens,
+            cost_usd=cost,
+            num_turns=num_turns,
+            model=model,
+        )
 
     # ------------------------------------------------------------------
     # Sandboxed execution
@@ -234,6 +263,9 @@ class AIRunner:
           - ``{"msg_type": "text", "text": "..."}``
           - ``{"msg_type": "tool_call", "name": "...", "summary": "..."}``
           - ``{"msg_type": "tool_result", "chars": N}``
+          - ``{"msg_type": "usage", "input_tokens": N, "output_tokens": N,
+               "cost_usd": float|None, "num_turns": N, "model": str|None}``
+            (one per final ``result`` event; ignored by text-only consumers)
         """
         try:
             evt = json.loads(line)
@@ -277,10 +309,37 @@ class AIRunner:
 
         elif etype == "result":
             # The result event duplicates assistant text already streamed
-            # above — only check for rate-limit errors, don't re-yield.
+            # above (so we don't re-yield it) but it carries the per-invocation
+            # usage totals — surface them as a ``usage`` event.
             result_text = evt.get("result", "")
             if isinstance(result_text, str) and "You've hit your limit" in result_text:
                 raise RateLimitError(result_text)
+
+            usage = evt.get("usage") or {}
+            # Fold cache_read + cache_creation tokens into input_tokens: Claude
+            # bills them as input, so counting them keeps token totals aligned
+            # with total_cost_usd.
+            input_tokens = (
+                int(usage.get("input_tokens", 0) or 0)
+                + int(usage.get("cache_read_input_tokens", 0) or 0)
+                + int(usage.get("cache_creation_input_tokens", 0) or 0)
+            )
+            output_tokens = int(usage.get("output_tokens", 0) or 0)
+            cost = evt.get("total_cost_usd")
+            # Claude Code result events may include a ``modelUsage`` map keyed
+            # by model id; use the first key as the reported model if present.
+            model = None
+            model_usage = evt.get("modelUsage")
+            if isinstance(model_usage, dict) and model_usage:
+                model = next(iter(model_usage))
+            yield {
+                "msg_type": "usage",
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": float(cost) if cost is not None else None,
+                "num_turns": int(evt.get("num_turns", 0) or 0),
+                "model": model,
+            }
 
         # system, rate_limit_event -- silently skipped
 

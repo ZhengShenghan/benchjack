@@ -71,6 +71,10 @@ class AuditPipeline:
         self._benchmark_name = _derive_benchmark_name(target)
         self._task_results: list[dict] = []
         self._task_ids: dict[str, str] = {}  # id → file path
+        # Per-phase usage accumulator: phase_id → {input_tokens, output_tokens,
+        # cost_usd, ai_calls}. Populated from the ai_runner "usage" events.
+        self._phase_usage: dict[str, dict] = {}
+        self._model_id: str | None = None
 
     # ------------------------------------------------------------------
     # Public
@@ -84,6 +88,7 @@ class AuditPipeline:
                 "restart the entire job to begin fresh."
             )
 
+        run_start = time.time()
         self._ensure_dirs()
         completed = self._try_resume()
 
@@ -127,6 +132,13 @@ class AuditPipeline:
                     break
         finally:
             await self.sandbox.stop_main_container()
+
+        # Dump the BenchGuard usage artifact next to state.json. Never let a
+        # write failure here break the run.
+        try:
+            self._write_usage_artifact(time.time() - run_start)
+        except Exception:
+            pass
 
         await self.emit("audit_complete", {
             "target": self.target,
@@ -183,12 +195,72 @@ class AuditPipeline:
         state["backend"] = self.ai.backend
         state["benchmark_name"] = self._benchmark_name
         state["benchmark_path"] = self.benchmark_path or ""
-        state.setdefault("phases", {})[phase_id] = {
+        if self._model_id:
+            state["model"] = self._model_id
+        phase_entry = {
             "status": result.status,
             "duration": round(result.duration, 1),
             "summary": result.summary,
         }
+        usage = self._phase_usage.get(phase_id)
+        if usage:
+            phase_entry["usage"] = usage
+        state.setdefault("phases", {})[phase_id] = phase_entry
         state_path.write_text(json.dumps(state, indent=2) + "\n")
+
+    def _write_usage_artifact(self, wall_clock_s: float):
+        """Write ``benchguard_usage.json`` next to ``state.json``.
+
+        Aggregates per-phase wall-clock (from PhaseResult.duration) and usage
+        (from the ai_runner ``usage`` events) into the BenchGuard schema.
+        ``tokens`` is defined as ``input_tokens + output_tokens``. For backends
+        that don't report usage (e.g. codex) token/cost fields stay 0/null and
+        only wall-clock is meaningful.
+        """
+        phase_order = [pid for pid, _ in PHASES]
+        seen = set(self.results) | set(self._phase_usage)
+        ordered = [p for p in phase_order if p in seen]
+        ordered += [p for p in seen if p not in phase_order]
+
+        stages: dict[str, dict] = {}
+        total_in = total_out = total_calls = 0
+        total_cost: float | None = None
+
+        for phase_id in ordered:
+            pu = self._phase_usage.get(phase_id, {})
+            in_t = int(pu.get("input_tokens", 0) or 0)
+            out_t = int(pu.get("output_tokens", 0) or 0)
+            cost = pu.get("cost_usd")
+            calls = int(pu.get("ai_calls", 0) or 0)
+            pr = self.results.get(phase_id)
+            duration = round(pr.duration, 3) if pr else 0.0
+            stages[phase_id] = {
+                "wall_clock_s": duration,
+                "ai_calls": calls,
+                "input_tokens": in_t,
+                "output_tokens": out_t,
+                "cost_usd": cost,
+            }
+            total_in += in_t
+            total_out += out_t
+            total_calls += calls
+            if cost is not None:
+                total_cost = (total_cost or 0.0) + cost
+
+        artifact = {
+            "tool": "benchjack",
+            "model": self._model_id or self.ai.model or self.ai.backend,
+            "wall_clock_s": round(wall_clock_s, 3),
+            "ai_calls": total_calls,
+            "input_tokens": total_in,
+            "output_tokens": total_out,
+            "tokens": total_in + total_out,
+            "cost_usd": total_cost,
+            "stages": stages,
+        }
+        (self.jacks_dir / "benchguard_usage.json").write_text(
+            json.dumps(artifact, indent=2) + "\n"
+        )
 
     def _save_findings(self):
         path = self.jacks_dir / "findings.json"
@@ -270,6 +342,9 @@ class AuditPipeline:
             idx = phase_ids.index(self.rerun_from)
             invalidated = set(phase_ids[idx:])
 
+        if state.get("model"):
+            self._model_id = state.get("model")
+
         bp = state.get("benchmark_path", "")
         if bp and os.path.isdir(bp):
             self.benchmark_path = bp
@@ -283,6 +358,8 @@ class AuditPipeline:
                     duration=phases_meta["setup"].get("duration", 0),
                     summary=phases_meta["setup"].get("summary", ""),
                 )
+                if phases_meta["setup"].get("usage"):
+                    self._phase_usage["setup"] = dict(phases_meta["setup"]["usage"])
                 completed.add("setup")
 
         if "setup" not in completed:
@@ -325,6 +402,8 @@ class AuditPipeline:
             summary_path = self.jacks_dir / "summary" / f"{phase_id}.md"
             if not summary_path.exists():
                 break
+            if meta.get("usage"):
+                self._phase_usage[phase_id] = dict(meta["usage"])
             self.results[phase_id] = PhaseResult(
                 phase=phase_id,
                 status="completed",
@@ -500,10 +579,33 @@ class AuditPipeline:
         await self.emit("log", {"phase": phase_id, "msg_type": "prompt", "text": prompt})
         text_parts: list[str] = []
         async for event in self.ai.stream(prompt):
+            if event.get("msg_type") == "usage":
+                self._accumulate_usage(phase_id, event)
+                continue
             await self.emit("log", {"phase": phase_id, **event})
             if event.get("msg_type") == "text":
                 text_parts.append(event["text"])
         return "\n".join(text_parts)
+
+    def _accumulate_usage(self, phase_id: str, event: dict):
+        """Fold one ai_runner ``usage`` event into the per-phase totals.
+
+        ``ai_calls`` counts one per ``result`` event (i.e. one per AI
+        invocation); a phase that makes several calls sums them.
+        """
+        pu = self._phase_usage.setdefault(
+            phase_id,
+            {"input_tokens": 0, "output_tokens": 0, "cost_usd": None, "ai_calls": 0},
+        )
+        pu["input_tokens"] += int(event.get("input_tokens", 0) or 0)
+        pu["output_tokens"] += int(event.get("output_tokens", 0) or 0)
+        pu["ai_calls"] += 1
+        cost = event.get("cost_usd")
+        if cost is not None:
+            pu["cost_usd"] = (pu["cost_usd"] or 0.0) + float(cost)
+        model = event.get("model")
+        if model and not self._model_id:
+            self._model_id = model
 
     # ------------------------------------------------------------------
     # Phase 1: Setup

@@ -72,9 +72,46 @@ class TestParseStreamJsonLine:
         evt = {"type": "system", "message": "init"}
         assert self._parse(json.dumps(evt)) == []
 
-    def test_result_event_ignored(self):
+    def test_result_event_yields_usage(self):
+        # A result event with no usage block still yields a usage event
+        # (ai_calls counting relies on one usage event per result), with
+        # zeroed tokens and null cost.
         evt = {"type": "result", "result": "final text"}
-        assert self._parse(json.dumps(evt)) == []
+        results = self._parse(json.dumps(evt))
+        assert len(results) == 1
+        assert results[0]["msg_type"] == "usage"
+        assert results[0]["input_tokens"] == 0
+        assert results[0]["output_tokens"] == 0
+        assert results[0]["cost_usd"] is None
+
+    def test_result_event_extracts_usage_and_cost(self):
+        evt = {
+            "type": "result",
+            "subtype": "success",
+            "duration_ms": 4200,
+            "duration_api_ms": 3900,
+            "num_turns": 7,
+            "total_cost_usd": 0.1234,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_creation_input_tokens": 200,
+                "cache_read_input_tokens": 300,
+            },
+            "modelUsage": {"claude-opus-4-8": {"inputTokens": 100}},
+            "result": "final text",
+            "session_id": "abc123",
+        }
+        results = self._parse(json.dumps(evt))
+        assert len(results) == 1
+        u = results[0]
+        assert u["msg_type"] == "usage"
+        # input_tokens folds cache_read + cache_creation: 100 + 300 + 200 = 600
+        assert u["input_tokens"] == 600
+        assert u["output_tokens"] == 50
+        assert u["cost_usd"] == pytest.approx(0.1234)
+        assert u["num_turns"] == 7
+        assert u["model"] == "claude-opus-4-8"
 
     def test_invalid_json_yields_text(self):
         results = self._parse("not json at all")
