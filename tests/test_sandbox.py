@@ -10,7 +10,13 @@ from unittest.mock import patch
 
 import pytest
 
-from server.sandbox import Sandbox, _host_gid, _host_uid
+from server.sandbox import (
+    Sandbox,
+    _host_gid,
+    _host_uid,
+    _inject_oauth_credentials,
+    _skip_special_files,
+)
 
 
 @pytest.fixture
@@ -185,3 +191,95 @@ class TestCredentialRefresh:
 
         asyncio.get_event_loop().run_until_complete(_run())
         sb.cleanup()
+
+    def test_refresh_loop_updates_credentials_file(self, tmp_path):
+        """The refresh must also rewrite the file the container CLI reads."""
+        tools = tmp_path / "tools"
+        tools.mkdir()
+        sb = Sandbox(str(tools), enabled=False)
+        sb._container_id = "alive"
+        sb._claude_dir = str(tmp_path)
+
+        async def _run():
+            with patch("server.sandbox._extract_claude_credentials",
+                       lambda: {"claudeAiOauth": {"accessToken": "tok-fresh"}}):
+                task = asyncio.create_task(
+                    sb._refresh_credentials_loop(interval=0.01)
+                )
+                await asyncio.sleep(0.05)
+                sb._container_id = None
+                await asyncio.wait_for(task, timeout=1.0)
+
+            creds = tmp_path / ".claude" / ".credentials.json"
+            assert creds.exists()
+            data = json.loads(creds.read_text())
+            assert data["claudeAiOauth"]["accessToken"] == "tok-fresh"
+
+        # asyncio.run rather than get_event_loop().run_until_complete(): the
+        # latter is what the older tests here use and it fails once another
+        # module in the suite has closed the loop.
+        asyncio.run(_run())
+        sb.cleanup()
+
+
+class TestSkipSpecialFiles:
+    """copytree must not choke on the sockets a live home directory holds."""
+
+    def test_skips_socket(self, tmp_path, monkeypatch):
+        import socket
+        # AF_UNIX paths are capped near 104 bytes, below pytest's tmp_path
+        # length, so bind relative from inside the directory.
+        monkeypatch.chdir(tmp_path)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind("ipc.sock")
+            (tmp_path / "config.json").write_text("{}")
+            skipped = _skip_special_files(str(tmp_path),
+                                          ["ipc.sock", "config.json"])
+        finally:
+            sock.close()
+        assert skipped == {"ipc.sock"}
+
+    def test_skips_fifo(self, tmp_path):
+        os.mkfifo(str(tmp_path / "pipe"))
+        (tmp_path / "keep.txt").write_text("x")
+        assert _skip_special_files(str(tmp_path), ["pipe", "keep.txt"]) == {"pipe"}
+
+    def test_keeps_regular_files_and_dirs(self, tmp_path):
+        (tmp_path / "a.json").write_text("{}")
+        (tmp_path / "sub").mkdir()
+        assert _skip_special_files(str(tmp_path), ["a.json", "sub"]) == set()
+
+    def test_unreadable_entry_is_skipped(self, tmp_path):
+        assert _skip_special_files(str(tmp_path), ["does-not-exist"]) == {
+            "does-not-exist"}
+
+
+class TestInjectOAuthCredentials:
+    def test_writes_both_locations(self, tmp_path):
+        creds = {"claudeAiOauth": {"accessToken": "tok-1"}}
+        _inject_oauth_credentials(str(tmp_path), creds)
+
+        config = json.loads((tmp_path / ".claude.json").read_text())
+        assert config["claudeAiOauth"]["accessToken"] == "tok-1"
+
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        assert json.loads(cred_file.read_text()) == creds
+
+    def test_credentials_file_is_owner_only(self, tmp_path):
+        _inject_oauth_credentials(str(tmp_path), {"claudeAiOauth": {}})
+        mode = (tmp_path / ".claude" / ".credentials.json").stat().st_mode
+        assert mode & 0o077 == 0
+
+    def test_preserves_unrelated_config_keys(self, tmp_path):
+        (tmp_path / ".claude.json").write_text(json.dumps({"theme": "dark"}))
+        _inject_oauth_credentials(str(tmp_path),
+                                  {"claudeAiOauth": {"accessToken": "tok-2"}})
+        config = json.loads((tmp_path / ".claude.json").read_text())
+        assert config["theme"] == "dark"
+        assert config["claudeAiOauth"]["accessToken"] == "tok-2"
+
+    def test_corrupt_config_is_replaced_not_fatal(self, tmp_path):
+        (tmp_path / ".claude.json").write_text("not json{{")
+        _inject_oauth_credentials(str(tmp_path), {"claudeAiOauth": {"a": 1}})
+        assert json.loads((tmp_path / ".claude.json").read_text())["claudeAiOauth"]

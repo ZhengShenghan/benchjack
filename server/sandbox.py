@@ -25,12 +25,64 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import AsyncGenerator
 
 log = logging.getLogger("benchjack.sandbox")
+
+
+def _skip_special_files(src: str, names: list[str]) -> set[str]:
+    """copytree ``ignore`` callback: drop entries ``copy2`` cannot reproduce.
+
+    A live home directory routinely holds unix sockets and FIFOs — a running
+    git ``fsmonitor--daemon.ipc``, a Codex ``ipc.sock``. ``shutil.copy2`` raises
+    ``OSError: [Errno 102] Operation not supported on socket`` on those, which
+    aborts the whole HOME copy and leaves the sandbox unable to start. None of
+    them carry credentials, so skipping is lossless.
+    """
+    skip = set()
+    for name in names:
+        try:
+            mode = os.lstat(os.path.join(src, name)).st_mode
+        except OSError:
+            skip.add(name)
+            continue
+        if (stat.S_ISSOCK(mode) or stat.S_ISFIFO(mode)
+                or stat.S_ISBLK(mode) or stat.S_ISCHR(mode)):
+            skip.add(name)
+    return skip
+
+
+def _inject_oauth_credentials(home: str, creds: dict) -> None:
+    """Place host OAuth credentials where the container's CLI will find them.
+
+    Claude Code on Linux authenticates from ``~/.claude/.credentials.json``; the
+    macOS host keeps the same payload in the Keychain instead, so nothing on
+    disk carries it over. Writing only ``~/.claude.json`` leaves the container
+    CLI reporting "Invalid API key", so write both: the config file for settings
+    and the credentials file for auth.
+    """
+    config_path = os.path.join(home, ".claude.json")
+    config: dict = {}
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as fh:
+                config = json.load(fh)
+        except Exception:
+            config = {}
+    config.update(creds)
+    with open(config_path, "w") as fh:
+        json.dump(config, fh)
+
+    creds_dir = os.path.join(home, ".claude")
+    os.makedirs(creds_dir, exist_ok=True)
+    creds_path = os.path.join(creds_dir, ".credentials.json")
+    with open(creds_path, "w") as fh:
+        json.dump(creds, fh)
+    os.chmod(creds_path, 0o600)
 
 # os.getuid/getgid are POSIX-only; fall back to 1000 on Windows so the
 # module imports cleanly and Docker-on-Windows users get a sane default.
@@ -256,14 +308,14 @@ class Sandbox:
 
         # Prefer explicit ANTHROPIC_API_KEY from the environment (stable);
         # only fall back to the short-lived OAuth access token from Keychain.
+        # Forward a real API key when the host has one. Do NOT fall back to the
+        # OAuth access token: it is not an API key, so the CLI rejects it with
+        # "Invalid API key", and setting the variable at all suppresses the
+        # claude.ai login path that would otherwise succeed. OAuth is carried by
+        # ~/.claude/.credentials.json in the mounted home instead.
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         if api_key:
             args += ["-e", f"ANTHROPIC_API_KEY={api_key}"]
-        else:
-            creds_json = _extract_claude_credentials()
-            oauth_token = (creds_json or {}).get("claudeAiOauth", {}).get("accessToken")
-            if oauth_token:
-                args += ["-e", f"ANTHROPIC_API_KEY={oauth_token}"]
 
         args += [
             "-v", f"{self._claude_dir}:/home/user",
@@ -438,6 +490,7 @@ class Sandbox:
             shutil.copytree(
                 str(claude_dir), dot_claude_dest,
                 dirs_exist_ok=True, ignore_dangling_symlinks=True,
+                ignore=_skip_special_files,
                 copy_function=shutil.copy2,
             )
         else:
@@ -454,16 +507,7 @@ class Sandbox:
         # without needing Keychain access.
         creds_json = _extract_claude_credentials()
         if creds_json:
-            config: dict = {}
-            if os.path.isfile(claude_json_dest):
-                try:
-                    with open(claude_json_dest) as fh:
-                        config = json.load(fh)
-                except Exception:
-                    config = {}
-            config.update(creds_json)
-            with open(claude_json_dest, "w") as fh:
-                json.dump(config, fh)
+            _inject_oauth_credentials(self._claude_dir, creds_json)
 
         # Copy ~/.codex/ so Codex can find its OAuth session
         codex_dir = Path.home() / ".codex"
@@ -471,6 +515,7 @@ class Sandbox:
             shutil.copytree(
                 str(codex_dir), os.path.join(self._claude_dir, ".codex"),
                 dirs_exist_ok=True, ignore_dangling_symlinks=True,
+                ignore=_skip_special_files,
                 copy_function=shutil.copy2,
             )
 
@@ -491,15 +536,8 @@ class Sandbox:
             creds = _extract_claude_credentials()
             if not creds:
                 continue
-            dest = os.path.join(self._claude_dir, ".claude.json")
             try:
-                config: dict = {}
-                if os.path.isfile(dest):
-                    with open(dest) as fh:
-                        config = json.load(fh)
-                config.update(creds)
-                with open(dest, "w") as fh:
-                    json.dump(config, fh)
+                _inject_oauth_credentials(self._claude_dir, creds)
                 log.debug("Refreshed OAuth credentials in mounted home dir")
             except Exception as exc:
                 log.warning("Failed to refresh credentials: %s", exc)
