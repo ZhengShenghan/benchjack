@@ -45,6 +45,19 @@ from .utils import (
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+#: Token categories carried end to end. ``input_tokens`` stays the inclusive
+#: total Claude bills as input (uncached + cache reads + cache writes) so every
+#: published figure keeps its meaning; the components sit beside it because the
+#: split is unrecoverable once discarded.
+_TOKEN_FIELDS = (
+    "input_tokens",
+    "uncached_input_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+    "output_tokens",
+)
+
+
 class AuditPipeline:
 
     def __init__(
@@ -223,13 +236,13 @@ class AuditPipeline:
         ordered += [p for p in seen if p not in phase_order]
 
         stages: dict[str, dict] = {}
-        total_in = total_out = total_calls = 0
+        totals = dict.fromkeys(_TOKEN_FIELDS, 0)
+        total_calls = 0
         total_cost: float | None = None
 
         for phase_id in ordered:
             pu = self._phase_usage.get(phase_id, {})
-            in_t = int(pu.get("input_tokens", 0) or 0)
-            out_t = int(pu.get("output_tokens", 0) or 0)
+            counts = {f: int(pu.get(f, 0) or 0) for f in _TOKEN_FIELDS}
             cost = pu.get("cost_usd")
             calls = int(pu.get("ai_calls", 0) or 0)
             pr = self.results.get(phase_id)
@@ -237,23 +250,23 @@ class AuditPipeline:
             stages[phase_id] = {
                 "wall_clock_s": duration,
                 "ai_calls": calls,
-                "input_tokens": in_t,
-                "output_tokens": out_t,
+                **counts,
                 "cost_usd": cost,
             }
-            total_in += in_t
-            total_out += out_t
+            for field in _TOKEN_FIELDS:
+                totals[field] += counts[field]
             total_calls += calls
             if cost is not None:
                 total_cost = (total_cost or 0.0) + cost
+        total_in = totals["input_tokens"]
+        total_out = totals["output_tokens"]
 
         artifact = {
             "tool": "benchjack",
             "model": self._model_id or self.ai.model or self.ai.backend,
             "wall_clock_s": round(wall_clock_s, 3),
             "ai_calls": total_calls,
-            "input_tokens": total_in,
-            "output_tokens": total_out,
+            **totals,
             "tokens": total_in + total_out,
             "cost_usd": total_cost,
             "stages": stages,
@@ -595,10 +608,18 @@ class AuditPipeline:
         """
         pu = self._phase_usage.setdefault(
             phase_id,
-            {"input_tokens": 0, "output_tokens": 0, "cost_usd": None, "ai_calls": 0},
+            {
+                "input_tokens": 0,
+                "uncached_input_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": None,
+                "ai_calls": 0,
+            },
         )
-        pu["input_tokens"] += int(event.get("input_tokens", 0) or 0)
-        pu["output_tokens"] += int(event.get("output_tokens", 0) or 0)
+        for field in _TOKEN_FIELDS:
+            pu[field] = pu.get(field, 0) + int(event.get(field, 0) or 0)
         pu["ai_calls"] += 1
         cost = event.get("cost_usd")
         if cost is not None:

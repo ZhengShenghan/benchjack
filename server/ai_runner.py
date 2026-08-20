@@ -319,10 +319,22 @@ class AIRunner:
             # Fold cache_read + cache_creation tokens into input_tokens: Claude
             # bills them as input, so counting them keeps token totals aligned
             # with total_cost_usd.
+            #
+            # The fold is kept, but the components are carried alongside it
+            # rather than discarded. They are not recoverable afterwards --
+            # not from state.json, not from the stdout log -- and without them
+            # a token total cannot be turned back into a cost. On a real
+            # clawsbench run, 1,231,214 input tokens cost $2.45 where the same
+            # count uncached lists at $7.00, because ~82% of it was cache
+            # reads. A token column that hides that share also cannot be
+            # compared against another tool's unless both name the same parts.
+            uncached_input_tokens = int(usage.get("input_tokens", 0) or 0)
+            cache_read_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
+            cache_creation_tokens = int(
+                usage.get("cache_creation_input_tokens", 0) or 0
+            )
             input_tokens = (
-                int(usage.get("input_tokens", 0) or 0)
-                + int(usage.get("cache_read_input_tokens", 0) or 0)
-                + int(usage.get("cache_creation_input_tokens", 0) or 0)
+                uncached_input_tokens + cache_read_tokens + cache_creation_tokens
             )
             output_tokens = int(usage.get("output_tokens", 0) or 0)
             cost = evt.get("total_cost_usd")
@@ -335,6 +347,9 @@ class AIRunner:
             yield {
                 "msg_type": "usage",
                 "input_tokens": input_tokens,
+                "uncached_input_tokens": uncached_input_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_creation_tokens": cache_creation_tokens,
                 "output_tokens": output_tokens,
                 "cost_usd": float(cost) if cost is not None else None,
                 "num_turns": int(evt.get("num_turns", 0) or 0),
