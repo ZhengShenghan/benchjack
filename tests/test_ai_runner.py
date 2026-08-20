@@ -84,6 +84,55 @@ class TestParseStreamJsonLine:
         assert results[0]["output_tokens"] == 0
         assert results[0]["cost_usd"] is None
 
+    def test_result_event_preserves_the_cache_split(self):
+        """The fold into ``input_tokens`` is not reversible afterwards.
+
+        Claude bills cache reads and cache writes as input, so folding them in
+        keeps the token total aligned with ``total_cost_usd`` -- but discarding
+        the components means a token total can no longer be turned back into a
+        cost, and two tools' totals cannot be compared unless both name the
+        same parts. On a real clawsbench run, 1,231,214 input tokens cost $2.45
+        where the same count uncached lists at $7.00, because ~82% of it was
+        cache reads. Neither ``state.json`` nor the stdout log preserved that
+        share, so it could not be recovered without re-running.
+        """
+        evt = {
+            "type": "result",
+            "total_cost_usd": 2.451778,
+            "usage": {
+                "input_tokens": 221082,
+                "cache_read_input_tokens": 1000000,
+                "cache_creation_input_tokens": 10132,
+                "output_tokens": 33652,
+            },
+        }
+        (usage,) = self._parse(json.dumps(evt))
+
+        # The inclusive total keeps its published meaning.
+        assert usage["input_tokens"] == 1231214
+        # ...and the components are now recoverable from it.
+        assert usage["uncached_input_tokens"] == 221082
+        assert usage["cache_read_tokens"] == 1000000
+        assert usage["cache_creation_tokens"] == 10132
+        assert usage["output_tokens"] == 33652
+        assert (
+            usage["uncached_input_tokens"]
+            + usage["cache_read_tokens"]
+            + usage["cache_creation_tokens"]
+            == usage["input_tokens"]
+        )
+
+    def test_a_result_without_cache_fields_reports_zero_components(self):
+        """A backend that reports no caching must not look like a cache miss
+        storm; the components stay zero and the total stays truthful."""
+        evt = {"type": "result", "usage": {"input_tokens": 500, "output_tokens": 20}}
+        (usage,) = self._parse(json.dumps(evt))
+
+        assert usage["input_tokens"] == 500
+        assert usage["uncached_input_tokens"] == 500
+        assert usage["cache_read_tokens"] == 0
+        assert usage["cache_creation_tokens"] == 0
+
     def test_result_event_extracts_usage_and_cost(self):
         evt = {
             "type": "result",
